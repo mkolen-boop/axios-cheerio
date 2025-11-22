@@ -1,111 +1,102 @@
+const express = require("express");
 const axios = require("axios");
 const cheerio = require("cheerio");
-const express = require("express");
+const puppeteer = require("puppeteer-extra");
+const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+
+puppeteer.use(StealthPlugin());
 
 const app = express();
 app.use(express.json());
 
+// Basic HTML scraper
+async function scrapeStatic(url) {
+  return axios.get(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+      "Accept": "text/html",
+    }
+  }).then((r) => r.data);
+}
+
+// Puppeteer Fallback
+async function scrapeBrowser(url) {
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-blink-features=AutomationControlled"
+    ]
+  });
+  const page = await browser.newPage();
+
+  await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
+
+  const html = await page.content();
+  await browser.close();
+  return html;
+}
+
 app.post("/scrape", async (req, res) => {
   const url = req.body.url;
-  if (!url) return res.status(400).json({ error: "url required" });
+
+  if (!url) {
+    return res.status(400).json({ error: "URL is required" });
+  }
 
   try {
-    const { data: html } = await axios.get(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-      }
-    });
+    let html;
+
+    // Try static scrape first
+    try {
+      html = await scrapeStatic(url);
+      if (!html || html.length < 5000) throw new Error("Static failed");
+    } catch {
+      // Fallback Puppeteer
+      html = await scrapeBrowser(url);
+    }
 
     const $ = cheerio.load(html);
 
-    // Title
-    const title =
-      $("h1").first().text().trim() ||
-      $('meta[property="og:title"]').attr("content") ||
-      $("title").text().trim() ||
-      null;
+    // Extract data
+    const title = $("h1.product-title").text().trim() || null;
+    const price = $("span.price").first().text().trim() || null;
+    const product_id = $("div.product-sku span.value").text().trim() || null;
 
-    // Price
-    const price =
-      $(".price, .product-price, [itemprop='price']").first().text().trim() ||
-      null;
-
-    // Currency
-    const currency =
-      $("[itemprop='priceCurrency']").attr("content") ||
-      (price && price.replace(/[0-9.,]/g, "").trim()) ||
-      null;
-
-    // Images
     const images = [];
-    $("img").each((i, el) => {
+    $("div.product-media img").each((i, el) => {
       const src = $(el).attr("src") || $(el).attr("data-src");
-      if (src && src.startsWith("http")) images.push(src);
+      if (src?.startsWith("http")) images.push(src);
     });
 
-    // Description
-    const description =
-      $(".description, .product-description, [itemprop='description']")
-        .first()
-        .text()
-        .trim() ||
-      null;
+    const description = $(".product-description").text().trim() || null;
 
-    // Availability
-    const availability =
-      $("[itemprop='availability']").attr("content") ||
-      $(".in-stock, .out-of-stock").text().trim() ||
-      null;
-
-    // Rating
-    const rating =
-      $("[itemprop='ratingValue']").attr("content") ||
-      $(".rating").first().text().trim() ||
-      null;
-
-    // Product ID / SKU
-    const product_id =
-      $("[itemprop='sku']").attr("content") ||
-      $(".sku").text().trim() ||
-      null;
-
-    // Category
-    const category =
-      $("[itemprop='category']").text().trim() ||
-      $('meta[property="product:category"]').attr("content") ||
-      null;
-
-    // Breadcrumbs
     const breadcrumbs = [];
-    $(".breadcrumb a").each((i, el) => {
-      const text = $(el).text().trim();
-      if (text) breadcrumbs.push(text);
+    $("nav.breadcrumb a").each((i, el) => {
+      const txt = $(el).text().trim();
+      if (txt) breadcrumbs.push(txt);
     });
 
-    // Meta tags
-    const meta = {
-      title: $('meta[name="title"]').attr("content") || null,
-      description: $('meta[name="description"]').attr("content") || null,
-      keywords: $('meta[name="keywords"]').attr("content") || null
-    };
+    let availability = null;
+    const btn = $("button.add-to-cart").text().trim();
+    if (btn.includes("Adauga în Coș")) availability = "in_stock";
+    if (btn.includes("Stoc epuizat")) availability = "out_of_stock";
 
     return res.json({
       title,
       price,
-      currency,
+      product_id,
       images,
       description,
-      availability,
-      rating,
-      product_id,
-      category,
       breadcrumbs,
-      meta,
-      raw_html: html.length > 10000 ? "trimmed" : html
+      availability,
+      url
     });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(3000, () => console.log("Scraper running on port 3000"));
+app.listen(3000, () => console.log("Scraper with Puppeteer running on 3000"));
